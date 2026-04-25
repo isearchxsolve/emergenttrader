@@ -1,0 +1,39 @@
+{
+  "summary": "Iteration 2 testing: P0 Decimal precision, Backtest engine, Settings/Webhook alerts, and Jupiter swap. Backend: 14/14 new pytest tests passed (decimal precision for 1.5e-7 priced coins, multi-buy cost basis, bots P&L fields, 4 backtest strategies, settings CRUD, webhook test/dispatch, Jupiter quote+build live against lite-api.jup.ag). Existing 29/29 pytest tests still pass = 43/43 total. Frontend: 3 test-blocking missing-import bugs found and fixed (Settings not imported in App.js, Webhook[s] icon doesn't exist in @phosphor-icons/react -> swapped to Bell, LiveSwap not imported in CoinDetail.jsx). After fixes, full UI flow verified: register -> dashboard -> /settings (renders, save+test-webhook works, persistence verified after reload), /bots (BACKTEST button opens panel, backtest runs and renders equity-curve chart), /coins/bonk (PAPER/LIVE toggle wired; LIVE shows liveswap-connect-phantom button for solana coins; PAPER shows execute-trade-btn).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_iteration2.py",
+    "/app/test_reports/pytest/iteration2_results.xml"
+  ],
+  "action_items": [
+    "Already-fixed-by-testing-agent (please review): App.js missing `import Settings from \"@/pages/Settings\"`, Settings.jsx imported non-existent `Webhooks` icon (renamed to `Bell`), CoinDetail.jsx referenced `LiveSwap` without importing it. All three were ReferenceErrors that crashed the page on first render. Consider adding an ESLint pre-commit (no-undef) to catch these earlier."
+  ],
+  "critical_code_review_comments": [
+    "Three ReferenceError import omissions shipped to preview (Settings, LiveSwap, Webhooks icon). Would have been caught by `eslint --rule no-undef:error` or a TS migration. Recommend adding lint to CI.",
+    "server.py is now ~950 lines — past the 700-line guideline. Still readable but consider splitting (auth, coins, trades, bots, ai, swap, settings, backtest) into a routers/ package.",
+    "_execute_trade now correctly uses Decimal for amount_coin / cost_basis math; verified with $50 @ 1.5e-7 -> ~3.33e8 coins (precision better than 1e-6 relative).",
+    "/api/settings/test-webhook returns 200 with {ok:false} on non-2xx but raises only on missing url. Acceptable.",
+    "Jupiter endpoints proxy lite-api.jup.ag with no auth and 12-15s timeout — fine, but consider caching the quote briefly on backend if UI polls.",
+    "dispatch_webhook is fire-and-forget via asyncio.create_task — good, but errors are only logged; consider per-user dead-letter counter for observability.",
+    "Settings.jsx loads webhook_url via useEffect after mount — there is a brief race where reload + immediate read returns empty. Tests now poll, but consider showing a loading state."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration2.py",
+    "/app/frontend/src/App.js",
+    "/app/frontend/src/pages/Settings.jsx",
+    "/app/frontend/src/pages/CoinDetail.jsx"
+  ],
+  "success_rate": {"backend": "100% (43/43 = 29 prior + 14 new)", "frontend": "100% (Settings, Bots backtest, Coin Detail PAPER/LIVE all working after import fixes)"},
+  "test_credentials": "Tests register fresh users dynamically (TEST_<uuid>@memetrade.io / TestPass2026!). Pre-seed account from /app/memory/test_credentials.md not pre-created in DB.",
+  "seed_data_creation": "None beyond ephemeral test users.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "All 4 new feature sets (Decimal, Backtest, Settings/Webhook, Jupiter) are working end-to-end. Next agent: re-run pytest on /app/backend/tests/ (43 tests, ~16s) and Playwright register->/settings->/bots(backtest)->/coins/bonk(LIVE toggle). Phantom signTransaction is NOT exercised in headless. The 3 import fixes I applied are minimal — main agent should adopt them or use better-named icons. Backend external base: https://coin-autopilot-1.preview.emergentagent.com.",
+  "rca_of_the_issue": "Three ReferenceError defects on first deploy because the new files were authored with usages but matching imports were forgotten. (1) /app/frontend/src/App.js used <Settings /> route element but `import Settings from '@/pages/Settings'` was missing. Mitigation: added import. (2) /app/frontend/src/pages/Settings.jsx imported `Webhooks` from `@phosphor-icons/react` but the package exports `Bell`/etc. — there's no `Webhook(s)` export. Mitigation: replaced with `Bell` (phosphor doesn't ship a webhook glyph; alternative: lucide-react has `Webhook`). (3) /app/frontend/src/pages/CoinDetail.jsx renders <LiveSwap/> but never imports it. Mitigation: added `import LiveSwap from '@/components/LiveSwap'`. All three crashed the page with a runtime ReferenceError visible in the dev overlay; would not have caught in a production build either since CRA dev compiles unused refs. Reproduction (pre-fix): visit /settings or /coins/bonk -> Uncaught runtime errors overlay. Post-fix: clean render."
+}

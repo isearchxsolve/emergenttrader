@@ -13,6 +13,7 @@ import Bots from "@/pages/Bots";
 import Trades from "@/pages/Trades";
 import Signals from "@/pages/Signals";
 import Wallet from "@/pages/Wallet";
+import Settings from "@/pages/Settings";
 import "@/App.css";
 
 function ProtectedRoute({ children }) {
@@ -38,6 +39,7 @@ function AppRouter() {
         <Route path="/trades" element={<Trades />} />
         <Route path="/signals" element={<Signals />} />
         <Route path="/wallet" element={<Wallet />} />
+        <Route path="/settings" element={<Settings />} />
       </Route>
     </Routes>
   );

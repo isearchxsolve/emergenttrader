@@ -1,6 +1,6 @@
 import { Outlet, NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
-import { ChartLine, Robot, Lightning, Receipt, Wallet, SignOut, GridFour } from "@phosphor-icons/react";
+import { ChartLine, Robot, Lightning, Receipt, Wallet, SignOut, GridFour, Gear } from "@phosphor-icons/react";
 
 export default function AppLayout() {
   const { user, logout } = useAuth();
@@ -12,6 +12,7 @@ export default function AppLayout() {
     { to: "/signals", label: "AI_SIGNALS", icon: Lightning, testId: "nav-signals" },
     { to: "/trades", label: "TRADES", icon: Receipt, testId: "nav-trades" },
     { to: "/wallet", label: "WALLETS", icon: Wallet, testId: "nav-wallet" },
+    { to: "/settings", label: "SETTINGS", icon: Gear, testId: "nav-settings" },
   ];
 
   const handleLogout = async () => {

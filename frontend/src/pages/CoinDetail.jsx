@@ -4,6 +4,7 @@ import api from "@/lib/api";
 import { LineChart, Line, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
 import { toast } from "sonner";
 import { ArrowLeft, Lightning } from "@phosphor-icons/react";
+import LiveSwap from "@/components/LiveSwap";
 
 export default function CoinDetail() {
   const { coinId } = useParams();
@@ -17,6 +18,7 @@ export default function CoinDetail() {
   const [signal, setSignal] = useState(null);
   const [signalLoading, setSignalLoading] = useState(false);
   const [portfolio, setPortfolio] = useState(null);
+  const [mode, setMode] = useState("paper"); // 'paper' | 'live'
 
   const refresh = async () => {
     const [c, p] = await Promise.all([api.get(`/coins/${coinId}`), api.get("/portfolio")]);
@@ -102,7 +104,16 @@ export default function CoinDetail() {
         <div className="lg:col-span-4 bg-[#0C0C12] flex flex-col">
           {/* Trade box */}
           <div>
-            <div className="px-4 py-3 border-b border-[#1A1A24] text-[10px] uppercase tracking-[0.3em] text-[#00FF66]">[ EXEC_TRADE ]</div>
+            <div className="px-4 py-3 border-b border-[#1A1A24] flex items-center justify-between">
+              <div className="text-[10px] uppercase tracking-[0.3em] text-[#00FF66]">[ EXEC_TRADE ]</div>
+              <div className="flex gap-px bg-[#1A1A24]">
+                <button onClick={()=>setMode("paper")} data-testid="mode-paper-btn" className={`px-2 py-0.5 text-[10px] ${mode==='paper'?'bg-[#00FF66] text-[#05050A]':'bg-[#0C0C12] text-[#8B949E]'}`}>PAPER</button>
+                <button onClick={()=>setMode("live")} data-testid="mode-live-btn" className={`px-2 py-0.5 text-[10px] ${mode==='live'?'bg-[#FFB800] text-[#05050A]':'bg-[#0C0C12] text-[#8B949E]'}`}>LIVE</button>
+              </div>
+            </div>
+            {mode === 'live' ? (
+              <LiveSwap coin={coin}/>
+            ) : (
             <div className="p-4 space-y-4">
               <div className="grid grid-cols-2 gap-px bg-[#1A1A24]">
                 <button onClick={()=>setSide("buy")} data-testid="side-buy-btn" className={`py-2 text-xs font-display tracking-wider ${side==='buy'?'bg-[#00FF66] text-[#05050A]':'bg-[#0C0C12] text-[#8B949E] hover:text-[#F8FAFC]'}`}>BUY</button>
@@ -124,6 +135,7 @@ export default function CoinDetail() {
                 {busy ? 'EXECUTING...' : `${side.toUpperCase()}_${coin?.symbol || ''} @ MKT`}
               </button>
             </div>
+            )}
           </div>
 
           {/* AI signal */}

@@ -11,12 +11,15 @@ import uuid
 import jwt
 import bcrypt
 import httpx
+from decimal import Decimal, getcontext
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Literal
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 from emergentintegrations.llm.chat import LlmChat, UserMessage
+
+getcontext().prec = 40  # high precision for ultra-low priced meme coins
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -229,18 +232,19 @@ async def logout(response: Response, session_token: Optional[str] = Cookie(None)
 
 # ---------- Coin Data ----------
 TRENDING_COINS = [
-    {"id": "dogecoin", "paprika": "doge-dogecoin", "symbol": "DOGE", "name": "Dogecoin", "chain": "multi"},
-    {"id": "shiba-inu", "paprika": "shib-shiba-inu", "symbol": "SHIB", "name": "Shiba Inu", "chain": "ethereum"},
-    {"id": "pepe", "paprika": "pepe-pepe", "symbol": "PEPE", "name": "Pepe", "chain": "ethereum"},
-    {"id": "bonk", "paprika": "bonk1-bonk", "symbol": "BONK", "name": "Bonk", "chain": "solana"},
-    {"id": "dogwifcoin", "paprika": "wif-dogwifhat", "symbol": "WIF", "name": "dogwifhat", "chain": "solana"},
-    {"id": "floki", "paprika": "floki-floki-inu", "symbol": "FLOKI", "name": "Floki", "chain": "ethereum"},
-    {"id": "book-of-meme", "paprika": "bome-book-of-meme", "symbol": "BOME", "name": "Book of Meme", "chain": "solana"},
-    {"id": "memecoin-2", "paprika": "meme-memecoin", "symbol": "MEME", "name": "Memecoin", "chain": "ethereum"},
-    {"id": "popcat", "paprika": "popcat-popcat", "symbol": "POPCAT", "name": "Popcat", "chain": "solana"},
-    {"id": "mog-coin", "paprika": "mog-mog-coin", "symbol": "MOG", "name": "Mog Coin", "chain": "ethereum"},
+    {"id": "dogecoin", "paprika": "doge-dogecoin", "symbol": "DOGE", "name": "Dogecoin", "chain": "multi", "mint": None},
+    {"id": "shiba-inu", "paprika": "shib-shiba-inu", "symbol": "SHIB", "name": "Shiba Inu", "chain": "ethereum", "mint": None},
+    {"id": "pepe", "paprika": "pepe-pepe", "symbol": "PEPE", "name": "Pepe", "chain": "ethereum", "mint": None},
+    {"id": "bonk", "paprika": "bonk1-bonk", "symbol": "BONK", "name": "Bonk", "chain": "solana", "mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"},
+    {"id": "dogwifcoin", "paprika": "wif-dogwifhat", "symbol": "WIF", "name": "dogwifhat", "chain": "solana", "mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"},
+    {"id": "floki", "paprika": "floki-floki-inu", "symbol": "FLOKI", "name": "Floki", "chain": "ethereum", "mint": None},
+    {"id": "book-of-meme", "paprika": "bome-book-of-meme", "symbol": "BOME", "name": "Book of Meme", "chain": "solana", "mint": "ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82"},
+    {"id": "memecoin-2", "paprika": "meme-memecoin", "symbol": "MEME", "name": "Memecoin", "chain": "ethereum", "mint": None},
+    {"id": "popcat", "paprika": "popcat-popcat", "symbol": "POPCAT", "name": "Popcat", "chain": "solana", "mint": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"},
+    {"id": "mog-coin", "paprika": "mog-mog-coin", "symbol": "MOG", "name": "Mog Coin", "chain": "ethereum", "mint": None},
 ]
 PAPRIKA_BY_GECKO = {c["id"]: c["paprika"] for c in TRENDING_COINS}
+SOL_MINT = "So11111111111111111111111111111111111111112"
 
 _price_cache: dict = {}
 _price_cache_ts: dict = {}
@@ -435,10 +439,10 @@ async def _execute_trade(user_id: str, body: dict, source: str = "manual", bot_i
     user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     if not user_doc:
         raise HTTPException(status_code=404, detail="User not found")
-    balance = user_doc.get("paper_balance_usd", 0)
+    balance = Decimal(str(user_doc.get("paper_balance_usd", 0)))
     side = body["side"]
-    amount_usd = body["amount_usd"]
-    price = body["price"]
+    amount_usd = Decimal(str(body["amount_usd"]))
+    price = Decimal(str(body["price"]))
     coin_id = body["coin_id"]
     if price <= 0:
         raise HTTPException(status_code=400, detail="Invalid price")
@@ -450,37 +454,42 @@ async def _execute_trade(user_id: str, body: dict, source: str = "manual", bot_i
             raise HTTPException(status_code=400, detail="Insufficient balance")
         new_balance = balance - amount_usd
         if pos:
-            new_amount = pos["amount"] + coin_amount
-            new_cost = pos["cost_basis"] + amount_usd
+            cur_amt = Decimal(str(pos["amount"]))
+            cur_cost = Decimal(str(pos["cost_basis"]))
+            new_amount = cur_amt + coin_amount
+            new_cost = cur_cost + amount_usd
+            avg = (new_cost / new_amount) if new_amount > 0 else Decimal(0)
             await db.positions.update_one({"user_id": user_id, "coin_id": coin_id},
-                {"$set": {"amount": new_amount, "cost_basis": new_cost, "avg_price": new_cost / new_amount if new_amount > 0 else 0}})
+                {"$set": {"amount": float(new_amount), "cost_basis": float(new_cost), "avg_price": float(avg)}})
         else:
             await db.positions.insert_one({
                 "user_id": user_id, "coin_id": coin_id, "coin_symbol": body["coin_symbol"], "coin_name": body["coin_name"],
-                "amount": coin_amount, "cost_basis": amount_usd, "avg_price": price,
+                "amount": float(coin_amount), "cost_basis": float(amount_usd), "avg_price": float(price),
             })
     else:  # sell
-        if not pos or pos["amount"] < coin_amount:
+        if not pos or Decimal(str(pos["amount"])) < coin_amount:
             raise HTTPException(status_code=400, detail="Insufficient holdings")
         new_balance = balance + amount_usd
-        new_amount = pos["amount"] - coin_amount
-        # proportional cost basis
-        cost_removed = pos["cost_basis"] * (coin_amount / pos["amount"]) if pos["amount"] > 0 else 0
-        new_cost = pos["cost_basis"] - cost_removed
+        cur_amt = Decimal(str(pos["amount"]))
+        cur_cost = Decimal(str(pos["cost_basis"]))
+        new_amount = cur_amt - coin_amount
+        cost_removed = cur_cost * (coin_amount / cur_amt) if cur_amt > 0 else Decimal(0)
+        new_cost = cur_cost - cost_removed
         await db.positions.update_one({"user_id": user_id, "coin_id": coin_id},
-            {"$set": {"amount": new_amount, "cost_basis": new_cost}})
-    await db.users.update_one({"user_id": user_id}, {"$set": {"paper_balance_usd": new_balance}})
+            {"$set": {"amount": float(new_amount), "cost_basis": float(new_cost)}})
+    await db.users.update_one({"user_id": user_id}, {"$set": {"paper_balance_usd": float(new_balance)}})
 
     trade_id = f"trade_{uuid.uuid4().hex[:12]}"
     trade = {
         "trade_id": trade_id, "user_id": user_id,
         "coin_id": coin_id, "coin_symbol": body["coin_symbol"], "coin_name": body["coin_name"],
-        "side": side, "amount_usd": amount_usd, "amount_coin": coin_amount, "price": price,
+        "side": side, "amount_usd": float(amount_usd), "amount_coin": float(coin_amount), "price": float(price),
         "source": source, "bot_id": bot_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     await db.trades.insert_one(trade)
     trade.pop("_id", None)
+    asyncio.create_task(dispatch_webhook(user_id, "trade", trade))
     return trade
 
 @api.get("/trades")
@@ -492,7 +501,23 @@ async def list_trades(current: User = Depends(get_current_user), limit: int = 10
 @api.get("/bots")
 async def list_bots(current: User = Depends(get_current_user)):
     cursor = db.bots.find({"user_id": current.user_id}, {"_id": 0})
-    return await cursor.to_list(100)
+    bots = await cursor.to_list(100)
+    if not bots:
+        return []
+    # Enrich with per-bot P&L
+    coin_ids = list({b["coin_id"] for b in bots})
+    prices = await fetch_prices(coin_ids)
+    for b in bots:
+        trades = await db.trades.find({"user_id": current.user_id, "bot_id": b["bot_id"]}, {"_id": 0}).to_list(1000)
+        buys_usd = sum(t["amount_usd"] for t in trades if t["side"] == "buy")
+        sells_usd = sum(t["amount_usd"] for t in trades if t["side"] == "sell")
+        coins_held = sum(t["amount_coin"] for t in trades if t["side"] == "buy") - sum(t["amount_coin"] for t in trades if t["side"] == "sell")
+        cur_price = prices.get(b["coin_id"], {}).get("price", 0)
+        unrealized = coins_held * cur_price
+        b["pnl_usd"] = round(sells_usd + unrealized - buys_usd, 4)
+        b["pnl_pct"] = round((b["pnl_usd"] / buys_usd * 100), 2) if buys_usd > 0 else 0.0
+        b["coins_held"] = round(coins_held, 6)
+    return bots
 
 @api.post("/bots")
 async def create_bot(body: BotIn, current: User = Depends(get_current_user)):
@@ -565,6 +590,7 @@ async def ai_signal(coin_id: str, current: User = Depends(get_current_user)):
     sig["timestamp"] = datetime.now(timezone.utc).isoformat()
     await db.ai_signals.insert_one({**sig, "user_id": current.user_id})
     sig.pop("_id", None)
+    asyncio.create_task(dispatch_webhook(current.user_id, "signal", sig))
     return sig
 
 @api.get("/ai/signals")
@@ -591,6 +617,226 @@ async def add_wallet(body: WalletIn, current: User = Depends(get_current_user)):
 async def delete_wallet(wallet_id: str, current: User = Depends(get_current_user)):
     await db.wallets.delete_one({"wallet_id": wallet_id, "user_id": current.user_id})
     return {"ok": True}
+
+# ---------- User Settings & Webhook Alerts ----------
+class SettingsIn(BaseModel):
+    webhook_url: Optional[str] = None
+    alert_on_trade: bool = True
+    alert_on_signal: bool = True
+
+@api.get("/settings")
+async def get_settings(current: User = Depends(get_current_user)):
+    s = await db.user_settings.find_one({"user_id": current.user_id}, {"_id": 0})
+    if not s:
+        s = {"user_id": current.user_id, "webhook_url": None, "alert_on_trade": True, "alert_on_signal": True}
+    s.pop("user_id", None)
+    return s
+
+@api.post("/settings")
+async def save_settings(body: SettingsIn, current: User = Depends(get_current_user)):
+    await db.user_settings.update_one(
+        {"user_id": current.user_id},
+        {"$set": {"webhook_url": body.webhook_url, "alert_on_trade": body.alert_on_trade, "alert_on_signal": body.alert_on_signal}},
+        upsert=True,
+    )
+    return {"ok": True}
+
+@api.post("/settings/test-webhook")
+async def test_webhook(current: User = Depends(get_current_user)):
+    s = await db.user_settings.find_one({"user_id": current.user_id}, {"_id": 0})
+    if not s or not s.get("webhook_url"):
+        raise HTTPException(status_code=400, detail="No webhook configured")
+    payload = {"type": "test", "message": "MemeTrade webhook test alert", "timestamp": datetime.now(timezone.utc).isoformat()}
+    try:
+        async with httpx.AsyncClient() as http:
+            r = await http.post(s["webhook_url"], json=payload, timeout=8.0)
+        return {"ok": r.status_code < 400, "status": r.status_code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+async def dispatch_webhook(user_id: str, event_type: str, data: dict):
+    try:
+        s = await db.user_settings.find_one({"user_id": user_id}, {"_id": 0})
+        if not s or not s.get("webhook_url"):
+            return
+        if event_type == "trade" and not s.get("alert_on_trade", True):
+            return
+        if event_type == "signal" and not s.get("alert_on_signal", True):
+            return
+        # Detect Slack/Discord webhook for nice formatting
+        url = s["webhook_url"]
+        body: dict
+        if "discord.com" in url:
+            if event_type == "trade":
+                body = {"content": f"🤖 **{data['side'].upper()}** {data['amount_coin']:.4f} {data['coin_symbol']} @ ${data['price']} (${data['amount_usd']:.2f}) · {data['source']}"}
+            else:
+                body = {"content": f"📡 **AI_SIGNAL** {data['coin_symbol']} → **{data['signal']}** ({data['confidence']}%) · risk={data['risk']}\n> {data.get('reasoning','')}"}
+        elif "hooks.slack.com" in url:
+            if event_type == "trade":
+                body = {"text": f"*{data['side'].upper()}* {data['amount_coin']:.4f} {data['coin_symbol']} @ ${data['price']} (${data['amount_usd']:.2f}) · _{data['source']}_"}
+            else:
+                body = {"text": f"*AI_SIGNAL* {data['coin_symbol']} → *{data['signal']}* ({data['confidence']}%) · risk={data['risk']}\n> {data.get('reasoning','')}"}
+        else:
+            body = {"type": event_type, "data": data, "timestamp": datetime.now(timezone.utc).isoformat()}
+        async with httpx.AsyncClient() as http:
+            await http.post(url, json=body, timeout=6.0)
+    except Exception as e:
+        logger.warning(f"webhook dispatch failed: {e}")
+
+# ---------- Backtest ----------
+class BacktestIn(BaseModel):
+    coin_id: str
+    strategy: Literal['momentum', 'dca', 'stop_loss_take_profit', 'ai_signal']
+    allocation_usd: float = 1000.0
+    config: dict = {}
+    days: int = 30
+
+@api.post("/backtest")
+async def backtest(body: BacktestIn, current: User = Depends(get_current_user)):
+    chart = await coin_chart(body.coin_id, days=body.days)
+    pts = chart.get("prices", [])
+    if len(pts) < 5:
+        raise HTTPException(status_code=400, detail="Not enough price data")
+    cfg = body.config or {}
+    cash = Decimal(str(body.allocation_usd))
+    holdings = Decimal(0)  # coin amount
+    cost_basis = Decimal(0)
+    trades = []
+    per_trade = Decimal(str(cfg.get("per_trade_usd", min(body.allocation_usd, 100))))
+
+    # Pre-compute "24h-equivalent change" using a rolling window
+    def pct_change(i, lookback):
+        if i - lookback < 0:
+            return 0.0
+        a = pts[i - lookback]["p"]
+        b = pts[i]["p"]
+        return (b - a) / a * 100 if a > 0 else 0
+
+    n = len(pts)
+    # estimate samples-per-day
+    span_ms = pts[-1]["t"] - pts[0]["t"] if n > 1 else 86400000
+    per_day = max(1, int(round(n / max(1, body.days))))
+    last_dca_idx = -10**9
+
+    for i, pt in enumerate(pts):
+        price = Decimal(str(pt["p"]))
+        action = None
+        if body.strategy == "momentum":
+            chg = pct_change(i, per_day)
+            if chg >= float(cfg.get("buy_change_pct", 5)) and holdings == 0 and cash >= per_trade:
+                action = "buy"
+            elif chg <= float(cfg.get("sell_change_pct", -3)) and holdings > 0:
+                action = "sell"
+        elif body.strategy == "dca":
+            interval_min = int(cfg.get("interval_minutes", 60))
+            samples_per_interval = max(1, int(per_day * (interval_min / 1440)))
+            if i - last_dca_idx >= samples_per_interval and cash >= per_trade:
+                action = "buy"; last_dca_idx = i
+        elif body.strategy == "stop_loss_take_profit":
+            if holdings == 0 and cash >= per_trade:
+                action = "buy"
+            elif holdings > 0 and cost_basis > 0:
+                avg = cost_basis / holdings
+                change_pct = (price - avg) / avg * 100 if avg > 0 else 0
+                if change_pct <= -Decimal(str(cfg.get("stop_loss_pct", 10))):
+                    action = "sell"
+                elif change_pct >= Decimal(str(cfg.get("take_profit_pct", 25))):
+                    action = "sell"
+        elif body.strategy == "ai_signal":
+            chg = pct_change(i, per_day)
+            if chg > 8 and holdings == 0 and cash >= per_trade:
+                action = "buy"
+            elif chg < -10 and holdings > 0:
+                action = "sell"
+
+        if action == "buy":
+            amt_coin = per_trade / price
+            holdings += amt_coin
+            cost_basis += per_trade
+            cash -= per_trade
+            trades.append({"t": pt["t"], "side": "buy", "price": float(price), "amount_usd": float(per_trade), "amount_coin": float(amt_coin)})
+        elif action == "sell" and holdings > 0:
+            proceeds = holdings * price
+            trades.append({"t": pt["t"], "side": "sell", "price": float(price), "amount_usd": float(proceeds), "amount_coin": float(holdings)})
+            cash += proceeds
+            holdings = Decimal(0)
+            cost_basis = Decimal(0)
+
+    final_price = Decimal(str(pts[-1]["p"]))
+    final_equity = cash + (holdings * final_price)
+    pnl = final_equity - Decimal(str(body.allocation_usd))
+    pnl_pct = (pnl / Decimal(str(body.allocation_usd)) * 100) if body.allocation_usd > 0 else Decimal(0)
+
+    # Equity curve (sample 200 points for display)
+    step = max(1, n // 200)
+    curve = []
+    cash_c = Decimal(str(body.allocation_usd))
+    holdings_c = Decimal(0)
+    cost_c = Decimal(0)
+    ti = 0
+    for i in range(0, n, step):
+        # fast-forward trades up to i
+        while ti < len(trades) and trades[ti]["t"] <= pts[i]["t"]:
+            t = trades[ti]
+            if t["side"] == "buy":
+                holdings_c += Decimal(str(t["amount_coin"])); cost_c += Decimal(str(t["amount_usd"])); cash_c -= Decimal(str(t["amount_usd"]))
+            else:
+                cash_c += Decimal(str(t["amount_usd"])); holdings_c = Decimal(0); cost_c = Decimal(0)
+            ti += 1
+        eq = cash_c + holdings_c * Decimal(str(pts[i]["p"]))
+        curve.append({"t": pts[i]["t"], "v": float(eq)})
+
+    return {
+        "coin_id": body.coin_id, "strategy": body.strategy, "days": body.days,
+        "starting_capital": body.allocation_usd,
+        "ending_equity": float(final_equity),
+        "pnl_usd": float(pnl), "pnl_pct": float(pnl_pct),
+        "trade_count": len(trades), "trades": trades,
+        "equity_curve": curve,
+    }
+
+# ---------- Jupiter (Solana) Swap Quote ----------
+@api.get("/swap/jupiter/quote")
+async def jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage_bps: int = 50, current: User = Depends(get_current_user)):
+    """Proxy to Jupiter v1 quote API (lite, no API key)."""
+    try:
+        url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}"
+        async with httpx.AsyncClient() as http:
+            r = await http.get(url, timeout=12.0)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Jupiter quote failed: {r.text[:200]}")
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Jupiter unreachable: {e}")
+
+class JupiterSwapIn(BaseModel):
+    quote_response: dict
+    user_public_key: str
+
+@api.post("/swap/jupiter/build")
+async def jupiter_build(body: JupiterSwapIn, current: User = Depends(get_current_user)):
+    """Returns base64 swap transaction for the user to sign with Phantom."""
+    try:
+        async with httpx.AsyncClient() as http:
+            r = await http.post(
+                "https://lite-api.jup.ag/swap/v1/swap",
+                json={
+                    "quoteResponse": body.quote_response,
+                    "userPublicKey": body.user_public_key,
+                    "wrapAndUnwrapSol": True,
+                    "computeUnitPriceMicroLamports": "auto",
+                },
+                timeout=15.0,
+            )
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Jupiter build failed: {r.text[:200]}")
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Jupiter unreachable: {e}")
 
 # ---------- Bot Engine (background loop) ----------
 async def evaluate_bot(bot: dict):
