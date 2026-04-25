@@ -1,0 +1,100 @@
+{
+  "project_name": "Meme Coin Auto Trading App",
+  "theme": "dark",
+  "archetype": "Archetype 7: Electric & Neon (Terminal Variant)",
+  "vibe_and_emotion": "Underground hacker, high-stakes crypto trading, professional yet extremely technical. A true command-center feeling with dense data, no fluff, zero distraction. It should look like a bespoke trading terminal built for degens.",
+  "typography": {
+    "heading_font": "JetBrains Mono",
+    "body_font": "IBM Plex Mono",
+    "font_strategy": "The 'Retro-Futurism / Terminal' Look. Everything is monospace to enforce the 'coding/terminal' aesthetic. High legibility for dense numbers.",
+    "hierarchy": {
+      "h1": "text-4xl sm:text-5xl font-black tracking-tight",
+      "h2": "text-2xl sm:text-3xl font-bold tracking-tight",
+      "h3": "text-xl sm:text-2xl font-semibold",
+      "h4": "text-lg font-medium",
+      "body": "text-sm",
+      "overline_label": "uppercase text-xs tracking-[0.2em] font-bold"
+    }
+  },
+  "color_palette": {
+    "background": "#05050A",
+    "surface": "#0C0C12",
+    "surface_hover": "#13131A",
+    "border": "#1A1A24",
+    "text_primary": "#F8FAFC",
+    "text_secondary": "#8B949E",
+    "primary_accent": "#00FF66",
+    "secondary_accent": "#FFB800",
+    "danger": "#FF3366",
+    "success": "#00FF66",
+    "rules": [
+      "Never use pure black or white. Background is tinted with deep indigo.",
+      "Primary accent (#00FF66) should be used extremely sparingly (active bots, positive P&L, key CTA).",
+      "Borders are critical: Use 1px sharp borders everywhere to define containers instead of shadows."
+    ]
+  },
+  "layout_spacing": {
+    "strategy": "MODE B: THE CONTROL ROOM GRID",
+    "container_padding": "p-4 sm:p-6",
+    "gap_strategy": "Tight gaps (gap-4 or gap-1px for grid borders).",
+    "border_radius": "rounded-none",
+    "surfaces": {
+      "dashboards": "Flat backgrounds, 1px subtle border, no shadow. The 'Grid Borders' look.",
+      "headers": "Solid background with a hard bottom border. No glassmorphism here, pure terminal tech.",
+      "modals": "Flat black background, sharp neon green 1px border for focus."
+    }
+  },
+  "component_instructions": {
+    "general": "Heavily customize Shadcn components to remove rounding (`rounded-none`). Use sharp edges.",
+    "buttons": "Flat, 1px border. Hover state should invert colors or slide a solid block of color.",
+    "tables": "Dense. Use `border-collapse`. Hide alternating row colors; instead rely on high-contrast text and hover states (`hover:bg-[#13131A]`).",
+    "charts": "Use Recharts. Ensure chart tooltip has black background with sharp 1px border. Chart lines must be 1.5px thick, strictly using primary/danger colors.",
+    "forms": "Inputs should have transparent backgrounds, 1px bottom border (or full sharp border), and glow green on focus (`focus:ring-0 focus:border-[#00FF66]`).",
+    "data_testid_rule": "All interactive and key informational elements MUST include a data-testid attribute in kebab-case."
+  },
+  "motion_interactions": {
+    "hover_states": "Slight brightness increase. For borders, change from `#1A1A24` to `#303040`.",
+    "transitions": "Instant or very fast (`duration-100`). No bouncy or elastic easing. Linear or sharp ease-out.",
+    "loaders": "ASCII art loaders or simple monospace text pulsing 'LOADING_...'."
+  },
+  "libraries": {
+    "icons": {
+      "package": "@phosphor-icons/react",
+      "command": "yarn add @phosphor-icons/react",
+      "usage": "Use Phosphor icons in 'regular' or 'duotone' weight for dense developer tools."
+    },
+    "charts": "recharts",
+    "motion": "framer-motion (use strictly for layout transitions, keep it minimal)",
+    "scrolling": "lenis (MANDATORY for momentum scrolling on landing page)"
+  },
+  "media": {
+    "image_urls": [
+      {
+        "url": "https://images.pexels.com/photos/7293759/pexels-photo-7293759.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "category": "meme_coin_logo",
+        "description": "Dogecoin macro shot, use for coin detail headers or trending list icons."
+      },
+      {
+        "url": "https://images.pexels.com/photos/14911398/pexels-photo-14911398.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "category": "eth_logo",
+        "description": "Ethereum silver coin close-up, use for chain selection or ETH base pairs."
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1660062993887-4938423dce59?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxOTB8MHwxfHNlYXJjaHwxfHxzb2xhbmElMjBjcnlwdG98ZW58MHx8fHwxNzc3MTU2NDkzfDA&ixlib=rb-4.1.0&q=85",
+        "category": "sol_logo",
+        "description": "Solana logo element, use for SOL network selection or pairs."
+      }
+    ],
+    "rules": "Never use placeholder images. If specific chain logos are missing, use typographic logos or geometric abstract shapes from the text itself (e.g. [ ETH ] / [ SOL ])."
+  },
+  "instructions_to_main_agent": [
+    "Read this JSON and implement EXACTLY as specified.",
+    "Do not use generic SaaS blue colors. Stick to the void black, neon green, amber, and electric pink palette.",
+    "Use Phosphor icons. Do not rely on lucide-react if Phosphor fits the terminal vibe better.",
+    "All components must be `rounded-none`. NO SOFT CORNERS.",
+    "For the trading chart, use Recharts and make it look like a TradingView dark theme setup.",
+    "Implement the 'Control Room' grid layout for the bot dashboard. Every pixel utilized, tall narrow lists, main chart taking center stage.",
+    "Ensure `data-testid` is added to all functional elements (e.g., `data-testid=\"buy-meme-button\"`).",
+    "For empty states or loaders, use monospace text like 'AWAITING_SIGNAL...' instead of generic spinners."
+  ]
+}
