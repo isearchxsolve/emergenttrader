@@ -33,6 +33,7 @@ function AppRouter() {
       <Route element={<ProtectedRoute><AppLayout /></ProtectedRoute>}>
         <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/coin/:coinId" element={<CoinDetail />} />
+        <Route path="/coins/:coinId" element={<CoinDetail />} />
         <Route path="/bots" element={<Bots />} />
         <Route path="/trades" element={<Trades />} />
         <Route path="/signals" element={<Signals />} />
