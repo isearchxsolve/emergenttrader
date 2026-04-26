@@ -1,0 +1,32 @@
+{
+  "summary": "Iteration 3 regression test after code-review refactor (evaluate_bot -> _decide_*/_bot_buy/_bot_sell helpers; backtest -> _bt_decide/_bt_build_curve helpers; hoisted random/json/re imports; React key fixes on Landing/Signals/Wallet; logout warning-on-failure). All 43/43 pytest tests pass (29 in backend_test.py + 14 in test_iteration2.py) in 8.46s. Frontend smoke test against external URL: login with seed creds (degen@memetrade.io / MemeMoon2026!) -> /dashboard works, Landing/Signals/Wallet/Bots routes render cleanly with ZERO React 'two children with the same key' or 'each child should have a unique key' warnings, logout-btn click redirects to /login successfully. console.warn for logout only fires on failure path (verified silent on happy path = expected).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_iteration2.py",
+    "/app/test_reports/pytest/iteration3_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is now 985 lines (was ~950) - past the 700-line guideline. The new _decide_*/_bot_buy/_bot_sell/_bt_decide/_bt_build_curve helpers are well-scoped and each <30 LOC, but the file would benefit from splitting into routers/ (auth, coins, trades, bots, ai, swap, settings, backtest) - same comment carried from iteration 2.",
+    "Refactor preserves behaviour cleanly: evaluate_bot now reads as a strategy-dispatch + buy/sell action separation; _bt_decide mirrors the same dispatch shape for backtest -> good DRY between live bot and backtest paths. Consider extracting the strategy enum to a single source of truth (currently duplicated: evaluate_bot dispatch and _bt_decide dispatch).",
+    "Composite React keys on Landing.jsx ticker (${c.id}-${i}), Signals.jsx (coin_id-timestamp fallback to sig-${i}), Wallet.jsx (p.url fallback to symbol-chain-${i}) are correct - duplicates in c.id (multi-chain duplicate symbol) or repeated signal coin_ids are now safely keyed.",
+    "auth.jsx logout: catch-only-warn + always-clear-local-state pattern is the right UX (network failure shouldn't trap user in logged-in UI). Verified happy-path is silent in console; failure path will produce single console.warn without bricking UI.",
+    "Hoisting random/json/re to module-top is correct; no circular import risk seen. random is now used in _decide_ai (heuristic confidence) and dispatch_webhook backoff jitter.",
+    "Pre-existing dev-mode console.error from Emergent's editor instrumentation injecting <span style='display:contents'> inside <option> in Signals.jsx -> 'In HTML, %s cannot be a child of %s'. NOT caused by this refactor and not visible in production builds. Optional: ignore or move the static-imported coin list out of <option> children to silence.",
+    "Backtest endpoint shape verified for all 4 strategies (momentum/dca/stop_loss_take_profit/ai_signal): pnl_usd, pnl_pct, trade_count, equity_curve, trades all present and correctly typed."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (43/43)", "frontend": "100% (Landing, Signals, Wallet, Bots, login, logout all clean)"},
+  "test_credentials": "degen@memetrade.io / MemeMoon2026! - already exists in DB from iteration 2; login worked first try.",
+  "seed_data_creation": "None new. Pytest creates ephemeral TEST_<uuid>@memetrade.io users.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "All 43 pytest cases in /app/backend/tests/ pass in ~8s. Frontend regression confirmed: zero React key warnings, login/logout working with seed creds. The refactor is a true non-functional change. Next agent: just re-run pytest and a 1-minute Playwright smoke (login -> visit /signals/wallet -> logout). Backend external base: https://coin-autopilot-1.preview.emergentagent.com.",
+  "rca_of_the_issue": "N/A - regression-only test, no defects found. The refactor (evaluate_bot helper extraction, backtest helper extraction, React key composite fixes, logout warn-on-failure) is behavior-preserving and all assertions in both backend_test.py (29 cases incl. CRUD persistence + bot lifecycle) and test_iteration2.py (14 cases incl. Decimal precision, 4 backtest strategy shapes, settings CRUD, webhook dispatch, Jupiter live calls) pass."
+}

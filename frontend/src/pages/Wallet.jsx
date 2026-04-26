@@ -120,7 +120,7 @@ export default function Wallet() {
           </thead>
           <tbody>
             {dexPairs.map((p, i) => (
-              <tr key={i} className="border-b border-[#1A1A24] hover:bg-[#13131A]">
+              <tr key={p.url || `${p.symbol}-${p.chain}-${i}`} className="border-b border-[#1A1A24] hover:bg-[#13131A]">
                 <td className="py-2 px-4 font-display">{p.symbol}</td>
                 <td className="text-[#8B949E]">{p.chain}</td>
                 <td className="text-right">${(p.price_usd ?? 0).toFixed(p.price_usd < 1 ? 8 : 4)}</td>

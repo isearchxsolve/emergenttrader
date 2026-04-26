@@ -48,7 +48,7 @@ export default function Signals() {
         <div className="px-4 py-3 border-b border-[#1A1A24] text-[10px] uppercase tracking-[0.3em] text-[#00FF66]">[ SIGNAL_HISTORY ]</div>
         <div className="divide-y divide-[#1A1A24]">
           {signals.map((s, i) => (
-            <div key={i} className="p-4 hover:bg-[#13131A]" data-testid={`signal-row-${i}`}>
+            <div key={s.timestamp ? `${s.coin_id}-${s.timestamp}` : `sig-${i}`} className="p-4 hover:bg-[#13131A]" data-testid={`signal-row-${i}`}>
               <div className="flex items-center justify-between flex-wrap gap-2">
                 <div className="flex items-center gap-3">
                   <div className="font-display text-sm">{s.coin_symbol}</div>

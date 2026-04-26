@@ -40,7 +40,7 @@ export default function Landing() {
           <div className="border-t border-[#1A1A24] overflow-hidden">
             <div className="ticker py-2 text-xs">
               {[...tickers, ...tickers].map((c, i) => (
-                <span key={i} className="px-6 text-[#8B949E]">
+                <span key={`${c.id}-${i}`} className="px-6 text-[#8B949E]">
                   <span className="text-[#F8FAFC] font-bold">{c.symbol}</span>
                   <span className="ml-2">${(c.price ?? 0).toFixed(c.price < 1 ? 8 : 4)}</span>
                   <span className={`ml-2 ${c.change_24h >= 0 ? 'text-[#00FF66]' : 'text-[#FF3366]'}`}>

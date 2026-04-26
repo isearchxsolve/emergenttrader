@@ -42,7 +42,8 @@ export function AuthProvider({ children }) {
     return r.data.user;
   };
   const logout = async () => {
-    try { await api.post("/auth/logout"); } catch {}
+    try { await api.post("/auth/logout"); }
+    catch (e) { console.warn("Logout API call failed (continuing client-side cleanup)", e); }
     localStorage.removeItem("token");
     setUser(null);
   };

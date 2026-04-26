@@ -5,6 +5,9 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
+import json
+import re
+import random
 import logging
 import asyncio
 import uuid
@@ -275,7 +278,6 @@ async def fetch_prices(coin_ids: List[str]) -> dict:
     needs = [c for c in coin_ids if now - _price_cache_ts.get(c, 0) > 60]
     if needs:
         # Try CoinGecko bulk
-        gecko_ok = False
         try:
             ids = ",".join(needs)
             url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true"
@@ -292,7 +294,6 @@ async def fetch_prices(coin_ids: List[str]) -> dict:
                             "volume_24h": payload.get("usd_24h_vol", 0) or 0,
                         }
                         _price_cache_ts[cid] = now
-                    gecko_ok = True
         except Exception as e:
             logger.warning(f"CoinGecko fetch failed: {e}")
         # Fallback to CoinPaprika per-coin for missing
@@ -339,7 +340,6 @@ async def coin_chart(coin_id: str, days: int = 1):
     pid = PAPRIKA_BY_GECKO.get(coin_id)
     if pid:
         try:
-            from urllib.parse import quote
             start = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).date().isoformat()
             interval = "1h" if days <= 7 else "1d"
             url = f"https://api.coinpaprika.com/v1/tickers/{pid}/historical?start={start}&interval={interval}"
@@ -362,10 +362,9 @@ async def coin_chart(coin_id: str, days: int = 1):
                     return {"prices": pts}
         except Exception as e:
             logger.warning(f"chart fetch (paprika) failed: {e}")
-    # Final fallback: synthetic walk seeded by current price
+    # Final fallback: synthetic walk seeded by current price (visual only — not security-sensitive)
     cur = (await fetch_prices([coin_id])).get(coin_id, {"price": 0})
     base = cur.get("price", 0) or 1.0
-    import random
     random.seed(hash(coin_id) & 0xFFFF)
     n = 96 if days <= 1 else (24 * days)
     pts = []
@@ -577,8 +576,6 @@ async def ai_signal(coin_id: str, current: User = Depends(get_current_user)):
     try:
         resp = await chat.send_message(UserMessage(text=prompt))
         text = str(resp).strip()
-        # try parse JSON
-        import json, re
         m = re.search(r"\{.*\}", text, re.S)
         sig = json.loads(m.group(0)) if m else {"signal": "HOLD", "confidence": 50, "reasoning": text[:280], "risk": "MED"}
     except Exception as e:
@@ -691,70 +688,104 @@ class BacktestIn(BaseModel):
     config: dict = {}
     days: int = 30
 
+
+def _bt_decide(strategy: str, cfg: dict, ctx: dict):
+    """Pure decision function for backtesting. ctx has: i, pts, per_day, holdings, cash, cost_basis, price, last_dca_idx."""
+    holdings, cash, cost_basis, price = ctx["holdings"], ctx["cash"], ctx["cost_basis"], ctx["price"]
+    per_trade = ctx["per_trade"]
+
+    def pct_change(lookback):
+        i = ctx["i"]
+        if i - lookback < 0:
+            return 0.0
+        a = ctx["pts"][i - lookback]["p"]
+        b = ctx["pts"][i]["p"]
+        return (b - a) / a * 100 if a > 0 else 0
+
+    if strategy == "momentum":
+        chg = pct_change(ctx["per_day"])
+        if chg >= float(cfg.get("buy_change_pct", 5)) and holdings == 0 and cash >= per_trade:
+            return "buy"
+        if chg <= float(cfg.get("sell_change_pct", -3)) and holdings > 0:
+            return "sell"
+    elif strategy == "dca":
+        interval_min = int(cfg.get("interval_minutes", 60))
+        samples_per_interval = max(1, int(ctx["per_day"] * (interval_min / 1440)))
+        if ctx["i"] - ctx["last_dca_idx"] >= samples_per_interval and cash >= per_trade:
+            return "buy"
+    elif strategy == "stop_loss_take_profit":
+        if holdings == 0 and cash >= per_trade:
+            return "buy"
+        if holdings > 0 and cost_basis > 0:
+            avg = cost_basis / holdings
+            change_pct = (price - avg) / avg * 100 if avg > 0 else 0
+            if change_pct <= -Decimal(str(cfg.get("stop_loss_pct", 10))):
+                return "sell"
+            if change_pct >= Decimal(str(cfg.get("take_profit_pct", 25))):
+                return "sell"
+    elif strategy == "ai_signal":
+        chg = pct_change(ctx["per_day"])
+        if chg > 8 and holdings == 0 and cash >= per_trade:
+            return "buy"
+        if chg < -10 and holdings > 0:
+            return "sell"
+    return None
+
+
+def _bt_build_curve(allocation_usd: float, pts: list, trades: list, n: int) -> list:
+    step = max(1, n // 200)
+    curve = []
+    cash_c = Decimal(str(allocation_usd))
+    holdings_c = Decimal(0)
+    ti = 0
+    for i in range(0, n, step):
+        while ti < len(trades) and trades[ti]["t"] <= pts[i]["t"]:
+            t = trades[ti]
+            if t["side"] == "buy":
+                holdings_c += Decimal(str(t["amount_coin"]))
+                cash_c -= Decimal(str(t["amount_usd"]))
+            else:
+                cash_c += Decimal(str(t["amount_usd"]))
+                holdings_c = Decimal(0)
+            ti += 1
+        eq = cash_c + holdings_c * Decimal(str(pts[i]["p"]))
+        curve.append({"t": pts[i]["t"], "v": float(eq)})
+    return curve
+
+
 @api.post("/backtest")
 async def backtest(body: BacktestIn, current: User = Depends(get_current_user)):
     chart = await coin_chart(body.coin_id, days=body.days)
     pts = chart.get("prices", [])
     if len(pts) < 5:
         raise HTTPException(status_code=400, detail="Not enough price data")
+
     cfg = body.config or {}
     cash = Decimal(str(body.allocation_usd))
-    holdings = Decimal(0)  # coin amount
+    holdings = Decimal(0)
     cost_basis = Decimal(0)
-    trades = []
+    trades: list = []
     per_trade = Decimal(str(cfg.get("per_trade_usd", min(body.allocation_usd, 100))))
-
-    # Pre-compute "24h-equivalent change" using a rolling window
-    def pct_change(i, lookback):
-        if i - lookback < 0:
-            return 0.0
-        a = pts[i - lookback]["p"]
-        b = pts[i]["p"]
-        return (b - a) / a * 100 if a > 0 else 0
-
     n = len(pts)
-    # estimate samples-per-day
-    span_ms = pts[-1]["t"] - pts[0]["t"] if n > 1 else 86400000
     per_day = max(1, int(round(n / max(1, body.days))))
     last_dca_idx = -10**9
 
     for i, pt in enumerate(pts):
         price = Decimal(str(pt["p"]))
-        action = None
-        if body.strategy == "momentum":
-            chg = pct_change(i, per_day)
-            if chg >= float(cfg.get("buy_change_pct", 5)) and holdings == 0 and cash >= per_trade:
-                action = "buy"
-            elif chg <= float(cfg.get("sell_change_pct", -3)) and holdings > 0:
-                action = "sell"
-        elif body.strategy == "dca":
-            interval_min = int(cfg.get("interval_minutes", 60))
-            samples_per_interval = max(1, int(per_day * (interval_min / 1440)))
-            if i - last_dca_idx >= samples_per_interval and cash >= per_trade:
-                action = "buy"; last_dca_idx = i
-        elif body.strategy == "stop_loss_take_profit":
-            if holdings == 0 and cash >= per_trade:
-                action = "buy"
-            elif holdings > 0 and cost_basis > 0:
-                avg = cost_basis / holdings
-                change_pct = (price - avg) / avg * 100 if avg > 0 else 0
-                if change_pct <= -Decimal(str(cfg.get("stop_loss_pct", 10))):
-                    action = "sell"
-                elif change_pct >= Decimal(str(cfg.get("take_profit_pct", 25))):
-                    action = "sell"
-        elif body.strategy == "ai_signal":
-            chg = pct_change(i, per_day)
-            if chg > 8 and holdings == 0 and cash >= per_trade:
-                action = "buy"
-            elif chg < -10 and holdings > 0:
-                action = "sell"
-
+        ctx = {
+            "i": i, "pts": pts, "per_day": per_day, "per_trade": per_trade,
+            "holdings": holdings, "cash": cash, "cost_basis": cost_basis,
+            "price": price, "last_dca_idx": last_dca_idx,
+        }
+        action = _bt_decide(body.strategy, cfg, ctx)
         if action == "buy":
             amt_coin = per_trade / price
             holdings += amt_coin
             cost_basis += per_trade
             cash -= per_trade
             trades.append({"t": pt["t"], "side": "buy", "price": float(price), "amount_usd": float(per_trade), "amount_coin": float(amt_coin)})
+            if body.strategy == "dca":
+                last_dca_idx = i
         elif action == "sell" and holdings > 0:
             proceeds = holdings * price
             trades.append({"t": pt["t"], "side": "sell", "price": float(price), "amount_usd": float(proceeds), "amount_coin": float(holdings)})
@@ -766,25 +797,7 @@ async def backtest(body: BacktestIn, current: User = Depends(get_current_user)):
     final_equity = cash + (holdings * final_price)
     pnl = final_equity - Decimal(str(body.allocation_usd))
     pnl_pct = (pnl / Decimal(str(body.allocation_usd)) * 100) if body.allocation_usd > 0 else Decimal(0)
-
-    # Equity curve (sample 200 points for display)
-    step = max(1, n // 200)
-    curve = []
-    cash_c = Decimal(str(body.allocation_usd))
-    holdings_c = Decimal(0)
-    cost_c = Decimal(0)
-    ti = 0
-    for i in range(0, n, step):
-        # fast-forward trades up to i
-        while ti < len(trades) and trades[ti]["t"] <= pts[i]["t"]:
-            t = trades[ti]
-            if t["side"] == "buy":
-                holdings_c += Decimal(str(t["amount_coin"])); cost_c += Decimal(str(t["amount_usd"])); cash_c -= Decimal(str(t["amount_usd"]))
-            else:
-                cash_c += Decimal(str(t["amount_usd"])); holdings_c = Decimal(0); cost_c = Decimal(0)
-            ti += 1
-        eq = cash_c + holdings_c * Decimal(str(pts[i]["p"]))
-        curve.append({"t": pts[i]["t"], "v": float(eq)})
+    curve = _bt_build_curve(body.allocation_usd, pts, trades, n)
 
     return {
         "coin_id": body.coin_id, "strategy": body.strategy, "days": body.days,
@@ -839,84 +852,105 @@ async def jupiter_build(body: JupiterSwapIn, current: User = Depends(get_current
         raise HTTPException(status_code=502, detail=f"Jupiter unreachable: {e}")
 
 # ---------- Bot Engine (background loop) ----------
+def _decide_momentum(cfg: dict, cur: dict, pos: dict):
+    threshold = float(cfg.get("buy_change_pct", 5.0))
+    sell_threshold = float(cfg.get("sell_change_pct", -3.0))
+    change = cur.get("change_24h", 0) or 0
+    if change >= threshold and pos["amount"] == 0:
+        return "buy", f"MOMENTUM: 24h+{change:.1f}%"
+    if change <= sell_threshold and pos["amount"] > 0:
+        return "sell", f"MOMENTUM: 24h{change:.1f}%"
+    return None, "HOLD"
+
+
+def _decide_dca(cfg: dict, bot: dict, price: float):
+    interval_min = int(cfg.get("interval_minutes", 60))
+    last_run = bot.get("last_run")
+    if last_run:
+        last_dt = datetime.fromisoformat(last_run) if isinstance(last_run, str) else last_run
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - last_dt).total_seconds() < interval_min * 60:
+            return None, "DCA_WAIT"
+    return "buy", f"DCA tick @ ${price:.6f}"
+
+
+def _decide_stop_take(cfg: dict, bot: dict, pos: dict, price: float):
+    if pos["amount"] == 0 and bot.get("entry_price", 0) > 0:
+        return "buy", "INITIAL_ENTRY"
+    if pos["amount"] > 0:
+        avg = pos["avg_price"]
+        change_pct = (price - avg) / avg * 100 if avg > 0 else 0
+        if change_pct <= -float(cfg.get("stop_loss_pct", 10)):
+            return "sell", f"STOP_LOSS @ {change_pct:.1f}%"
+        if change_pct >= float(cfg.get("take_profit_pct", 25)):
+            return "sell", f"TAKE_PROFIT @ {change_pct:.1f}%"
+    return None, "HOLD"
+
+
+def _decide_ai(cur: dict, pos: dict):
+    change = cur.get("change_24h", 0) or 0
+    if change > 8 and pos["amount"] == 0:
+        return "buy", f"AI: bullish surge +{change:.1f}%"
+    if change < -10 and pos["amount"] > 0:
+        return "sell", f"AI: bearish dump {change:.1f}%"
+    return None, "HOLD"
+
+
+async def _bot_buy(bot: dict, cfg: dict, price: float):
+    per_trade = float(cfg.get("per_trade_usd", min(bot["allocation_usd"], 100)))
+    u = await db.users.find_one({"user_id": bot["user_id"]}, {"_id": 0})
+    if not u or u["paper_balance_usd"] < per_trade:
+        return False, "INSUFFICIENT_BAL"
+    try:
+        await _execute_trade(bot["user_id"], {
+            "coin_id": bot["coin_id"], "coin_symbol": bot["coin_symbol"], "coin_name": bot["coin_symbol"],
+            "side": "buy", "amount_usd": per_trade, "price": price,
+        }, source="bot", bot_id=bot["bot_id"])
+        await db.bots.update_one({"bot_id": bot["bot_id"]}, {"$inc": {"trades_count": 1}})
+        return True, None
+    except Exception as e:
+        return False, f"ERR:{e}"
+
+
+async def _bot_sell(bot: dict, pos: dict, price: float):
+    sell_value = pos["amount"] * price
+    try:
+        await _execute_trade(bot["user_id"], {
+            "coin_id": bot["coin_id"], "coin_symbol": bot["coin_symbol"], "coin_name": bot["coin_symbol"],
+            "side": "sell", "amount_usd": sell_value, "price": price,
+        }, source="bot", bot_id=bot["bot_id"])
+        await db.bots.update_one({"bot_id": bot["bot_id"]}, {"$inc": {"trades_count": 1}})
+        return True, None
+    except Exception as e:
+        return False, f"ERR:{e}"
+
+
 async def evaluate_bot(bot: dict):
     cur = await coin_detail(bot["coin_id"])
     price = cur.get("price", 0)
     if price <= 0:
         return None, "NO_PRICE"
     cfg = bot.get("config", {})
-    strategy = bot["strategy"]
-    user_id = bot["user_id"]
-    pos = await db.positions.find_one({"user_id": user_id, "coin_id": bot["coin_id"]}, {"_id": 0}) or {"amount": 0, "avg_price": 0}
+    pos = await db.positions.find_one({"user_id": bot["user_id"], "coin_id": bot["coin_id"]}, {"_id": 0}) or {"amount": 0, "avg_price": 0}
 
-    action = None
-    reason = "HOLD"
-
-    if strategy == "momentum":
-        threshold = float(cfg.get("buy_change_pct", 5.0))
-        sell_threshold = float(cfg.get("sell_change_pct", -3.0))
-        change = cur.get("change_24h", 0) or 0
-        if change >= threshold and pos["amount"] == 0:
-            action = "buy"; reason = f"MOMENTUM: 24h+{change:.1f}%"
-        elif change <= sell_threshold and pos["amount"] > 0:
-            action = "sell"; reason = f"MOMENTUM: 24h{change:.1f}%"
-
-    elif strategy == "dca":
-        interval_min = int(cfg.get("interval_minutes", 60))
-        last_run = bot.get("last_run")
-        if last_run:
-            last_dt = datetime.fromisoformat(last_run) if isinstance(last_run, str) else last_run
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
-            if (datetime.now(timezone.utc) - last_dt).total_seconds() < interval_min * 60:
-                return None, "DCA_WAIT"
-        action = "buy"; reason = f"DCA tick @ ${price:.6f}"
-
-    elif strategy == "stop_loss_take_profit":
-        if pos["amount"] == 0 and bot.get("entry_price", 0) > 0:
-            action = "buy"; reason = "INITIAL_ENTRY"
-        elif pos["amount"] > 0:
-            avg = pos["avg_price"]
-            stop_pct = float(cfg.get("stop_loss_pct", 10))
-            tp_pct = float(cfg.get("take_profit_pct", 25))
-            change_pct = (price - avg) / avg * 100 if avg > 0 else 0
-            if change_pct <= -stop_pct:
-                action = "sell"; reason = f"STOP_LOSS @ {change_pct:.1f}%"
-            elif change_pct >= tp_pct:
-                action = "sell"; reason = f"TAKE_PROFIT @ {change_pct:.1f}%"
-
-    elif strategy == "ai_signal":
-        # Use simple heuristic: positive momentum + volume signal AI-like
-        change = cur.get("change_24h", 0) or 0
-        if change > 8 and pos["amount"] == 0:
-            action = "buy"; reason = f"AI: bullish surge +{change:.1f}%"
-        elif change < -10 and pos["amount"] > 0:
-            action = "sell"; reason = f"AI: bearish dump {change:.1f}%"
+    deciders = {
+        "momentum": lambda: _decide_momentum(cfg, cur, pos),
+        "dca": lambda: _decide_dca(cfg, bot, price),
+        "stop_loss_take_profit": lambda: _decide_stop_take(cfg, bot, pos, price),
+        "ai_signal": lambda: _decide_ai(cur, pos),
+    }
+    decide = deciders.get(bot["strategy"])
+    if not decide:
+        return None, "UNKNOWN_STRATEGY"
+    action, reason = decide()
 
     if action == "buy":
-        per_trade = float(cfg.get("per_trade_usd", min(bot["allocation_usd"], 100)))
-        u = await db.users.find_one({"user_id": user_id}, {"_id": 0})
-        if u and u["paper_balance_usd"] >= per_trade:
-            try:
-                await _execute_trade(user_id, {
-                    "coin_id": bot["coin_id"], "coin_symbol": bot["coin_symbol"], "coin_name": bot["coin_symbol"],
-                    "side": "buy", "amount_usd": per_trade, "price": price,
-                }, source="bot", bot_id=bot["bot_id"])
-                await db.bots.update_one({"bot_id": bot["bot_id"]}, {"$inc": {"trades_count": 1}})
-                return action, reason
-            except Exception as e:
-                return None, f"ERR:{e}"
-    elif action == "sell" and pos["amount"] > 0:
-        sell_value = pos["amount"] * price
-        try:
-            await _execute_trade(user_id, {
-                "coin_id": bot["coin_id"], "coin_symbol": bot["coin_symbol"], "coin_name": bot["coin_symbol"],
-                "side": "sell", "amount_usd": sell_value, "price": price,
-            }, source="bot", bot_id=bot["bot_id"])
-            await db.bots.update_one({"bot_id": bot["bot_id"]}, {"$inc": {"trades_count": 1}})
-            return action, reason
-        except Exception as e:
-            return None, f"ERR:{e}"
+        ok, err = await _bot_buy(bot, cfg, price)
+        return (action, reason) if ok else (None, err or reason)
+    if action == "sell" and pos["amount"] > 0:
+        ok, err = await _bot_sell(bot, pos, price)
+        return (action, reason) if ok else (None, err or reason)
     return None, reason
 
 async def bot_engine_loop():
