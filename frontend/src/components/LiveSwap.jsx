@@ -18,6 +18,7 @@ export default function LiveSwap({ coin }) {
   const [amountSol, setAmountSol] = useState(0.1);
   const [quote, setQuote] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [quoteAgeSec, setQuoteAgeSec] = useState(0);
 
   useEffect(() => {
     if (window?.solana?.isPhantom && window.solana.publicKey) {
@@ -46,13 +47,32 @@ export default function LiveSwap({ coin }) {
         : { input_mint: coin.mint, output_mint: SOL_MINT, amount: lamports };
       const r = await api.get("/swap/jupiter/quote", { params: { ...params, slippage_bps: 100 } });
       setQuote(r.data);
+      setQuoteAgeSec(0);
     } catch (e) { toast.error(e?.response?.data?.detail || "Quote failed"); }
     finally { setBusy(false); }
   };
 
+  useEffect(() => {
+    if (!quote?._meta?.quoted_at_ms) return;
+    const timer = setInterval(() => {
+      const age = (Date.now() - quote._meta.quoted_at_ms) / 1000;
+      setQuoteAgeSec(age);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [quote]);
+
   const execute = async () => {
     if (!quote) return toast.error("Run quote first");
     if (!phantomAddr) return toast.error("Connect Phantom first");
+    const impactPct = (parseFloat(quote.priceImpactPct || 0) * 100);
+    const okay = window.confirm(
+      `Confirm LIVE ${side.toUpperCase()}?\n\n` +
+      `Coin: ${coin?.symbol}\n` +
+      `Impact: ${impactPct.toFixed(3)}%\n` +
+      `Quote Age: ${quoteAgeSec.toFixed(0)}s\n` +
+      `Wallet: ${phantomAddr.slice(0, 6)}...${phantomAddr.slice(-4)}`
+    );
+    if (!okay) return;
     setBusy(true);
     try {
       const r = await api.post("/swap/jupiter/build", { quote_response: quote, user_public_key: phantomAddr });
@@ -107,12 +127,14 @@ export default function LiveSwap({ coin }) {
           <Row label="OUT" val={`${(quote.outAmount / (side==='buy' ? 1e5 : 1e9)).toFixed(4)} ${side==='buy' ? coin.symbol : 'SOL'}`}/>
           <Row label="IMPACT" val={`${(parseFloat(quote.priceImpactPct || 0) * 100).toFixed(3)}%`}/>
           <Row label="ROUTE" val={`${quote.routePlan?.length || 1} hops`}/>
+          <Row label="QUOTE_AGE" val={`${quoteAgeSec.toFixed(0)}s`}/>
+          <Row label="MAX_SLIPPAGE" val={`${quote?._meta?.max_slippage_bps ?? "?"} bps`}/>
         </div>
       )}
-      <button onClick={execute} disabled={busy || !quote || !phantomAddr} data-testid="liveswap-execute-btn" className={`w-full py-2 font-display tracking-wider transition-colors disabled:opacity-50 ${side==='buy'?'border border-[#00FF66] bg-[#00FF66] text-[#05050A] hover:bg-transparent hover:text-[#00FF66]':'border border-[#FF3366] bg-[#FF3366] text-[#05050A] hover:bg-transparent hover:text-[#FF3366]'}`}>
+      <button onClick={execute} disabled={busy || !quote || !phantomAddr || quoteAgeSec > 15} data-testid="liveswap-execute-btn" className={`w-full py-2 font-display tracking-wider transition-colors disabled:opacity-50 ${side==='buy'?'border border-[#00FF66] bg-[#00FF66] text-[#05050A] hover:bg-transparent hover:text-[#00FF66]':'border border-[#FF3366] bg-[#FF3366] text-[#05050A] hover:bg-transparent hover:text-[#FF3366]'}`}>
         <Lightning size={12} className="inline mr-1"/>{busy?'SIGNING...':`EXEC_LIVE_${side.toUpperCase()}`}
       </button>
-      <div className="text-[10px] text-[#8B949E] leading-relaxed">⚠ Real on-chain swap via Jupiter. Mainnet SOL gas applies. Transaction signs via Phantom.</div>
+      <div className="text-[10px] text-[#8B949E] leading-relaxed">⚠ Real on-chain swap via Jupiter. Mainnet SOL gas applies. Transaction signs via Phantom. Always re-quote if age is high.</div>
     </div>
   );
 }

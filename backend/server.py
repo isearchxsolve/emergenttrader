@@ -14,6 +14,8 @@ import uuid
 import jwt
 import bcrypt
 import httpx
+import hmac
+import hashlib
 from decimal import Decimal, getcontext
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
@@ -36,6 +38,24 @@ EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# ---------- Risk / Runtime Settings ----------
+MAX_TRADE_USD = Decimal(os.environ.get("MAX_TRADE_USD", "1000"))
+MIN_NOTIONAL_USD = Decimal(os.environ.get("MIN_NOTIONAL_USD", "1"))
+MAX_DAILY_LOSS_USD = Decimal(os.environ.get("MAX_DAILY_LOSS_USD", "500"))
+MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "10"))
+MAX_SLIPPAGE_BPS = int(os.environ.get("MAX_SLIPPAGE_BPS", "100"))
+QUOTE_MAX_AGE_SEC = int(os.environ.get("QUOTE_MAX_AGE_SEC", "15"))
+TRADING_PAUSED_DEFAULT = os.environ.get("TRADING_PAUSED", "false").lower() == "true"
+BOT_ERROR_THRESHOLD = int(os.environ.get("BOT_ERROR_THRESHOLD", "5"))
+BOT_COOLDOWN_SEC = int(os.environ.get("BOT_COOLDOWN_SEC", "120"))
+RECONCILE_INTERVAL_SEC = int(os.environ.get("RECONCILE_INTERVAL_SEC", "300"))
+ALLOWED_COIN_IDS = {c.strip() for c in os.environ.get("ALLOWED_COIN_IDS", "").split(",") if c.strip()}
+BLOCKED_COIN_IDS = {c.strip() for c in os.environ.get("BLOCKED_COIN_IDS", "").split(",") if c.strip()}
+ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
+ACTION_SIGNING_SECRET = os.environ.get("ACTION_SIGNING_SECRET", "")
+RISK_STATE_DOC_ID = "global"
+STRATEGY_VERSION = "v1"
+
 # ---------- Models ----------
 class RegisterIn(BaseModel):
     email: EmailStr
@@ -52,6 +72,7 @@ class User(BaseModel):
     name: str
     picture: Optional[str] = None
     auth_provider: str = "jwt"
+    role: str = "trader"
     paper_balance_usd: float = 10000.0
 
 class TradeIn(BaseModel):
@@ -129,13 +150,116 @@ async def get_current_user(
 # ---------- Lifespan ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await ensure_indexes()
+    await db.risk_state.update_one(
+        {"_id": RISK_STATE_DOC_ID},
+        {"$setOnInsert": {
+            "trading_paused": TRADING_PAUSED_DEFAULT,
+            "paused_reason": None,
+            "bot_consecutive_errors": 0,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }},
+        upsert=True,
+    )
     bot_task = asyncio.create_task(bot_engine_loop())
+    reconcile_task = asyncio.create_task(reconciliation_loop())
     yield
     bot_task.cancel()
+    reconcile_task.cancel()
     client.close()
 
 app = FastAPI(lifespan=lifespan)
 api = APIRouter(prefix="/api")
+
+
+async def ensure_indexes():
+    await db.users.create_index("user_id", unique=True)
+    await db.positions.create_index([("user_id", 1), ("coin_id", 1)], unique=True)
+    await db.trades.create_index([("user_id", 1), ("timestamp", -1)])
+    await db.bots.create_index([("user_id", 1), ("active", 1)])
+    await db.idempotency_keys.create_index([("user_id", 1), ("idempotency_key", 1), ("endpoint", 1)], unique=True)
+    await db.order_audit.create_index([("user_id", 1), ("timestamp", -1)])
+    await db.reconciliation_reports.create_index([("created_at", -1)])
+
+
+async def get_risk_state() -> dict:
+    state = await db.risk_state.find_one({"_id": RISK_STATE_DOC_ID}, {"_id": 0})
+    return state or {"trading_paused": TRADING_PAUSED_DEFAULT, "paused_reason": None, "bot_consecutive_errors": 0}
+
+
+async def set_risk_state(**updates):
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.risk_state.update_one({"_id": RISK_STATE_DOC_ID}, {"$set": updates}, upsert=True)
+
+
+async def append_audit_event(user_id: Optional[str], event_type: str, payload: dict):
+    await db.order_audit.insert_one({
+        "audit_id": f"audit_{uuid.uuid4().hex[:16]}",
+        "user_id": user_id,
+        "event_type": event_type,
+        "payload": payload,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def is_admin(user: User) -> bool:
+    if getattr(user, "role", "trader") == "admin":
+        return True
+    return user.email.lower() in ADMIN_EMAILS
+
+
+def require_admin(user: User):
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+
+def _action_signature_expected(user_id: str, action: str, ts: str) -> str:
+    msg = f"{user_id}:{action}:{ts}".encode()
+    return hmac.new(ACTION_SIGNING_SECRET.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def verify_action_signature(user: User, action: str, ts: Optional[str], signature: Optional[str]):
+    if not ACTION_SIGNING_SECRET:
+        return
+    if not ts or not signature:
+        raise HTTPException(status_code=401, detail="Missing action signature headers")
+    expected = _action_signature_expected(user.user_id, action, ts)
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(status_code=401, detail="Invalid action signature")
+
+
+async def enforce_risk_checks(user_id: str, body: dict):
+    state = await get_risk_state()
+    if state.get("trading_paused"):
+        raise HTTPException(status_code=423, detail=f"Trading paused: {state.get('paused_reason') or 'manual halt'}")
+
+    coin_id = body["coin_id"]
+    side = body["side"]
+    amount_usd = Decimal(str(body["amount_usd"]))
+    if amount_usd > MAX_TRADE_USD:
+        raise HTTPException(status_code=400, detail=f"Risk check failed: amount exceeds MAX_TRADE_USD ({MAX_TRADE_USD})")
+    if amount_usd < MIN_NOTIONAL_USD:
+        raise HTTPException(status_code=400, detail=f"Risk check failed: amount below MIN_NOTIONAL_USD ({MIN_NOTIONAL_USD})")
+    if ALLOWED_COIN_IDS and coin_id not in ALLOWED_COIN_IDS:
+        raise HTTPException(status_code=400, detail="Risk check failed: coin not in allowlist")
+    if coin_id in BLOCKED_COIN_IDS:
+        raise HTTPException(status_code=400, detail="Risk check failed: coin is blocklisted")
+
+    open_positions = await db.positions.count_documents({"user_id": user_id, "amount": {"$gt": 0}})
+    already_open = await db.positions.find_one({"user_id": user_id, "coin_id": coin_id, "amount": {"$gt": 0}}, {"_id": 0})
+    if side == "buy" and not already_open and open_positions >= MAX_OPEN_POSITIONS:
+        raise HTTPException(status_code=400, detail=f"Risk check failed: max open positions reached ({MAX_OPEN_POSITIONS})")
+
+    start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    trades = await db.trades.find(
+        {"user_id": user_id, "timestamp": {"$gte": start_of_day}},
+        {"_id": 0, "side": 1, "amount_usd": 1},
+    ).to_list(5000)
+    buys = sum(Decimal(str(t.get("amount_usd", 0))) for t in trades if t.get("side") == "buy")
+    sells = sum(Decimal(str(t.get("amount_usd", 0))) for t in trades if t.get("side") == "sell")
+    daily_loss_proxy = buys - sells if buys > sells else Decimal(0)
+    if side == "buy" and daily_loss_proxy >= MAX_DAILY_LOSS_USD:
+        raise HTTPException(status_code=400, detail=f"Risk check failed: max daily loss reached ({MAX_DAILY_LOSS_USD})")
 
 # ---------- Auth Routes ----------
 @api.post("/auth/register")
@@ -150,6 +274,7 @@ async def register(body: RegisterIn):
         "name": body.name,
         "picture": None,
         "auth_provider": "jwt",
+        "role": "admin" if body.email.lower() in ADMIN_EMAILS else "trader",
         "password_hash": hash_password(body.password),
         "paper_balance_usd": 10000.0,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -203,6 +328,7 @@ async def google_session(request: Request, response: Response):
             "name": name,
             "picture": picture,
             "auth_provider": "google",
+            "role": "admin" if email.lower() in ADMIN_EMAILS else "trader",
             "paper_balance_usd": 10000.0,
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
@@ -431,10 +557,30 @@ async def get_portfolio(current: User = Depends(get_current_user)):
     }
 
 @api.post("/trades")
-async def execute_trade(body: TradeIn, current: User = Depends(get_current_user)):
-    return await _execute_trade(current.user_id, body.dict(), source="manual")
+async def execute_trade(
+    body: TradeIn,
+    current: User = Depends(get_current_user),
+    idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+):
+    payload = body.dict()
+    if idempotency_key:
+        existing = await db.idempotency_keys.find_one(
+            {"user_id": current.user_id, "idempotency_key": idempotency_key, "endpoint": "/trades"},
+            {"_id": 0, "response": 1},
+        )
+        if existing and existing.get("response"):
+            return existing["response"]
+    trade = await _execute_trade(current.user_id, payload, source="manual")
+    if idempotency_key:
+        await db.idempotency_keys.update_one(
+            {"user_id": current.user_id, "idempotency_key": idempotency_key, "endpoint": "/trades"},
+            {"$set": {"response": trade, "created_at": datetime.now(timezone.utc).isoformat()}},
+            upsert=True,
+        )
+    return trade
 
 async def _execute_trade(user_id: str, body: dict, source: str = "manual", bot_id: Optional[str] = None):
+    await enforce_risk_checks(user_id, body)
     user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     if not user_doc:
         raise HTTPException(status_code=404, detail="User not found")
@@ -486,7 +632,12 @@ async def _execute_trade(user_id: str, body: dict, source: str = "manual", bot_i
         "source": source, "bot_id": bot_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    logger.info("trade_execute user=%s source=%s bot=%s coin=%s side=%s amount_usd=%s price=%s", user_id, source, bot_id, coin_id, side, float(amount_usd), float(price))
     await db.trades.insert_one(trade)
+    await append_audit_event(user_id, "trade_executed", {"source": source, "bot_id": bot_id, "trade_id": trade_id, "side": side, "coin_id": coin_id, "amount_usd": float(amount_usd)})
+    updated_user = await db.users.find_one({"user_id": user_id}, {"_id": 0, "paper_balance_usd": 1})
+    if updated_user and Decimal(str(updated_user.get("paper_balance_usd", 0))) < 0:
+        logger.error("consistency_guard: negative paper balance for user=%s", user_id)
     trade.pop("_id", None)
     asyncio.create_task(dispatch_webhook(user_id, "trade", trade))
     return trade
@@ -526,10 +677,10 @@ async def create_bot(body: BotIn, current: User = Depends(get_current_user)):
     bot = {
         "bot_id": bot_id, "user_id": current.user_id,
         "name": body.name, "coin_id": body.coin_id, "coin_symbol": body.coin_symbol,
-        "strategy": body.strategy, "allocation_usd": body.allocation_usd,
+        "strategy": body.strategy, "strategy_version": STRATEGY_VERSION, "allocation_usd": body.allocation_usd,
         "config": body.config, "active": True, "entry_price": entry_price,
         "trades_count": 0, "pnl_usd": 0.0,
-        "last_run": None, "last_action": "INITIALIZED",
+        "last_run": None, "last_action": "INITIALIZED", "status": "running", "last_error": None, "cooldown_until": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.bots.insert_one(bot)
@@ -800,7 +951,8 @@ async def backtest(body: BacktestIn, current: User = Depends(get_current_user)):
     curve = _bt_build_curve(body.allocation_usd, pts, trades, n)
 
     return {
-        "coin_id": body.coin_id, "strategy": body.strategy, "days": body.days,
+        "coin_id": body.coin_id, "strategy": body.strategy, "strategy_version": STRATEGY_VERSION, "days": body.days,
+        "config_used": cfg,
         "starting_capital": body.allocation_usd,
         "ending_equity": float(final_equity),
         "pnl_usd": float(pnl), "pnl_pct": float(pnl_pct),
@@ -813,12 +965,26 @@ async def backtest(body: BacktestIn, current: User = Depends(get_current_user)):
 async def jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage_bps: int = 50, current: User = Depends(get_current_user)):
     """Proxy to Jupiter v1 quote API (lite, no API key)."""
     try:
-        url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}"
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="Amount must be > 0")
+        safe_slippage_bps = min(max(1, slippage_bps), MAX_SLIPPAGE_BPS)
+        url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={safe_slippage_bps}"
         async with httpx.AsyncClient() as http:
             r = await http.get(url, timeout=12.0)
         if r.status_code != 200:
             raise HTTPException(status_code=502, detail=f"Jupiter quote failed: {r.text[:200]}")
-        return r.json()
+        quote = r.json()
+        impact_pct = float(quote.get("priceImpactPct", 0) or 0) * 100
+        if impact_pct > (MAX_SLIPPAGE_BPS / 100):
+            raise HTTPException(status_code=400, detail=f"Quote rejected: price impact {impact_pct:.3f}% exceeds policy")
+        if int(quote.get("outAmount", 0) or 0) <= 0:
+            raise HTTPException(status_code=400, detail="Quote rejected: no executable outAmount")
+        quote["_meta"] = {
+            "quoted_at_ms": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "max_slippage_bps": MAX_SLIPPAGE_BPS,
+            "enforced_slippage_bps": safe_slippage_bps,
+        }
+        return quote
     except HTTPException:
         raise
     except Exception as e:
@@ -832,6 +998,13 @@ class JupiterSwapIn(BaseModel):
 async def jupiter_build(body: JupiterSwapIn, current: User = Depends(get_current_user)):
     """Returns base64 swap transaction for the user to sign with Phantom."""
     try:
+        qmeta = body.quote_response.get("_meta", {})
+        quoted_at_ms = int(qmeta.get("quoted_at_ms", 0) or 0)
+        if quoted_at_ms <= 0:
+            raise HTTPException(status_code=400, detail="Quote missing freshness metadata")
+        age_sec = (int(datetime.now(timezone.utc).timestamp() * 1000) - quoted_at_ms) / 1000
+        if age_sec > QUOTE_MAX_AGE_SEC:
+            raise HTTPException(status_code=400, detail=f"Quote expired ({age_sec:.1f}s > {QUOTE_MAX_AGE_SEC}s)")
         async with httpx.AsyncClient() as http:
             r = await http.post(
                 "https://lite-api.jup.ag/swap/v1/swap",
@@ -958,22 +1131,222 @@ async def bot_engine_loop():
     await asyncio.sleep(5)
     while True:
         try:
+            state = await get_risk_state()
+            if state.get("trading_paused"):
+                await asyncio.sleep(30)
+                continue
             cursor = db.bots.find({"active": True}, {"_id": 0})
             bots = await cursor.to_list(500)
             for b in bots:
+                cooldown_until = b.get("cooldown_until")
+                if cooldown_until:
+                    cd = datetime.fromisoformat(cooldown_until) if isinstance(cooldown_until, str) else cooldown_until
+                    if cd.tzinfo is None:
+                        cd = cd.replace(tzinfo=timezone.utc)
+                    if cd > datetime.now(timezone.utc):
+                        continue
                 action, reason = await evaluate_bot(b)
+                logger.info("bot_eval bot=%s strategy=%s action=%s reason=%s", b.get("bot_id"), b.get("strategy"), action, reason)
+                update = {"last_run": datetime.now(timezone.utc).isoformat(), "last_action": reason}
+                if reason and str(reason).startswith("ERR:"):
+                    update["status"] = "error"
+                    update["last_error"] = reason
+                    update["cooldown_until"] = (datetime.now(timezone.utc) + timedelta(seconds=BOT_COOLDOWN_SEC)).isoformat()
+                    next_err = int(state.get("bot_consecutive_errors", 0)) + 1
+                    state["bot_consecutive_errors"] = next_err
+                    await set_risk_state(bot_consecutive_errors=next_err)
+                    if next_err >= BOT_ERROR_THRESHOLD:
+                        await set_risk_state(trading_paused=True, paused_reason=f"bot error threshold reached ({BOT_ERROR_THRESHOLD})")
+                        await append_audit_event(None, "trading_paused", {"reason": "bot_error_threshold"})
+                else:
+                    update["status"] = "running"
+                    update["last_error"] = None
+                    update["cooldown_until"] = None
+                    if state.get("bot_consecutive_errors", 0) != 0:
+                        state["bot_consecutive_errors"] = 0
+                        await set_risk_state(bot_consecutive_errors=0)
                 await db.bots.update_one(
                     {"bot_id": b["bot_id"]},
-                    {"$set": {"last_run": datetime.now(timezone.utc).isoformat(), "last_action": reason}},
+                    {"$set": update},
                 )
         except Exception as e:
             logger.exception(f"bot_engine error: {e}")
         await asyncio.sleep(30)
 
+
+async def run_reconciliation() -> dict:
+    users = await db.users.find({}, {"_id": 0, "user_id": 1, "paper_balance_usd": 1}).to_list(10000)
+    mismatches = []
+    checked = 0
+    for u in users:
+        user_id = u["user_id"]
+        checked += 1
+        trades = await db.trades.find({"user_id": user_id}, {"_id": 0, "side": 1, "amount_usd": 1, "coin_id": 1, "amount_coin": 1}).to_list(100000)
+        expected_balance = Decimal("10000")
+        holdings = {}
+        for t in trades:
+            amt_usd = Decimal(str(t.get("amount_usd", 0)))
+            amt_coin = Decimal(str(t.get("amount_coin", 0)))
+            cid = t.get("coin_id")
+            if t.get("side") == "buy":
+                expected_balance -= amt_usd
+                holdings[cid] = holdings.get(cid, Decimal(0)) + amt_coin
+            else:
+                expected_balance += amt_usd
+                holdings[cid] = holdings.get(cid, Decimal(0)) - amt_coin
+        actual_balance = Decimal(str(u.get("paper_balance_usd", 0)))
+        if abs(expected_balance - actual_balance) > Decimal("0.01"):
+            mismatches.append({
+                "user_id": user_id,
+                "type": "balance",
+                "expected": float(expected_balance),
+                "actual": float(actual_balance),
+                "delta": float(expected_balance - actual_balance),
+            })
+        positions = await db.positions.find({"user_id": user_id}, {"_id": 0, "coin_id": 1, "amount": 1}).to_list(10000)
+        for p in positions:
+            cid = p["coin_id"]
+            expected_amt = holdings.get(cid, Decimal(0))
+            actual_amt = Decimal(str(p.get("amount", 0)))
+            if abs(expected_amt - actual_amt) > Decimal("0.000001"):
+                mismatches.append({
+                    "user_id": user_id,
+                    "type": "position",
+                    "coin_id": cid,
+                    "expected": float(expected_amt),
+                    "actual": float(actual_amt),
+                    "delta": float(expected_amt - actual_amt),
+                })
+
+    report = {
+        "report_id": f"recon_{uuid.uuid4().hex[:12]}",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "users_checked": checked,
+        "mismatch_count": len(mismatches),
+        "mismatches": mismatches[:500],
+    }
+    await db.reconciliation_reports.insert_one(report)
+    if mismatches:
+        await append_audit_event(None, "reconciliation_mismatch", {"count": len(mismatches), "report_id": report["report_id"]})
+    return report
+
+
+async def reconciliation_loop():
+    await asyncio.sleep(15)
+    while True:
+        try:
+            await run_reconciliation()
+        except Exception as e:
+            logger.exception("reconciliation_loop error: %s", e)
+        await asyncio.sleep(RECONCILE_INTERVAL_SEC)
+
 # ---------- Health ----------
 @api.get("/")
 async def root():
     return {"app": "Meme Coin Auto Trading", "status": "live"}
+
+
+@api.get("/health/live")
+async def health_live():
+    return {"ok": True, "status": "live", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@api.get("/health/ready")
+async def health_ready():
+    db_ok = True
+    provider_ok = True
+    try:
+        await db.command("ping")
+    except Exception:
+        db_ok = False
+    try:
+        async with httpx.AsyncClient() as http:
+            r = await http.get("https://api.coingecko.com/api/v3/ping", timeout=5.0)
+        provider_ok = r.status_code == 200
+    except Exception:
+        provider_ok = False
+    ok = db_ok and provider_ok
+    return JSONResponse(status_code=200 if ok else 503, content={"ok": ok, "db_ok": db_ok, "provider_ok": provider_ok})
+
+
+@api.get("/risk/status")
+async def risk_status(current: User = Depends(get_current_user)):
+    state = await get_risk_state()
+    return {
+        "trading_paused": state.get("trading_paused", False),
+        "paused_reason": state.get("paused_reason"),
+        "bot_consecutive_errors": state.get("bot_consecutive_errors", 0),
+        "action_signing_required": bool(ACTION_SIGNING_SECRET),
+        "limits": {
+            "max_trade_usd": float(MAX_TRADE_USD),
+            "min_notional_usd": float(MIN_NOTIONAL_USD),
+            "max_daily_loss_usd": float(MAX_DAILY_LOSS_USD),
+            "max_open_positions": MAX_OPEN_POSITIONS,
+            "max_slippage_bps": MAX_SLIPPAGE_BPS,
+            "quote_max_age_sec": QUOTE_MAX_AGE_SEC,
+        },
+    }
+
+
+@api.get("/metrics")
+async def metrics(current: User = Depends(get_current_user)):
+    require_admin(current)
+    trades_24h = await db.trades.count_documents({"timestamp": {"$gte": (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()}})
+    active_bots = await db.bots.count_documents({"active": True})
+    err_bots = await db.bots.count_documents({"status": "error"})
+    users = await db.users.count_documents({})
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "users_total": users,
+        "trades_24h": trades_24h,
+        "bots_active": active_bots,
+        "bots_error": err_bots,
+    }
+
+
+@api.post("/risk/pause-all")
+async def pause_all(
+    request: Request,
+    current: User = Depends(get_current_user),
+    action_ts: Optional[str] = Header(None, alias="X-Action-Timestamp"),
+    action_sig: Optional[str] = Header(None, alias="X-Action-Signature"),
+):
+    require_admin(current)
+    verify_action_signature(current, "pause_all", action_ts, action_sig)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    reason = body.get("reason") or f"manual pause by {current.user_id}"
+    await set_risk_state(trading_paused=True, paused_reason=reason)
+    await append_audit_event(current.user_id, "trading_paused", {"reason": reason})
+    return {"ok": True, "trading_paused": True, "reason": reason}
+
+
+@api.post("/risk/resume-all")
+async def resume_all(
+    current: User = Depends(get_current_user),
+    action_ts: Optional[str] = Header(None, alias="X-Action-Timestamp"),
+    action_sig: Optional[str] = Header(None, alias="X-Action-Signature"),
+):
+    require_admin(current)
+    verify_action_signature(current, "resume_all", action_ts, action_sig)
+    await set_risk_state(trading_paused=False, paused_reason=None, bot_consecutive_errors=0)
+    await append_audit_event(current.user_id, "trading_resumed", {})
+    return {"ok": True, "trading_paused": False}
+
+
+@api.get("/ops/reconciliation/latest")
+async def reconciliation_latest(current: User = Depends(get_current_user)):
+    require_admin(current)
+    r = await db.reconciliation_reports.find_one({}, {"_id": 0}, sort=[("created_at", -1)])
+    return r or {"ok": False, "detail": "No reconciliation report yet"}
+
+
+@api.post("/ops/reconciliation/run")
+async def reconciliation_run(current: User = Depends(get_current_user)):
+    require_admin(current)
+    return await run_reconciliation()
 
 app.include_router(api)
 app.add_middleware(
